@@ -2,3 +2,6 @@
 resume/*
 about_me.md
 *xlsx
+*.db
+*.pyc
+__pycache__/*

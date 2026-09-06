@@ -1,13 +1,49 @@
-import requests
-import json
 import logging
+import json
+import re
+import asyncio
+from google.adk.agents import Agent
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
 
 logger = logging.getLogger(__name__)
 
+def _run_adk_agent_sync(prompt: str, instruction: str) -> str:
+    """Helper to run the ADK Agent synchronously."""
+    agent = Agent(
+        name="resume_agent",
+        model="ollama/qwen2.5:7b",
+        instruction=instruction,
+    )
+
+    async def _run():
+        session_service = InMemorySessionService()
+        await session_service.create_session(app_name="app", user_id="user", session_id="s1")
+        runner = Runner(agent=agent, app_name="app", session_service=session_service)
+
+        result_text = ""
+        try:
+            async for event in runner.run_async(
+                user_id="user", session_id="s1",
+                new_message=types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+            ):
+                if event.is_final_response() and event.content:
+                    for part in event.content.parts:
+                        if hasattr(part, 'text') and part.text:
+                            result_text += part.text
+        except Exception as e:
+            logger.error(f"Error running ADK Agent: {e}")
+
+        return result_text.strip()
+
+    return asyncio.run(_run())
+
 def extract_job_details_with_ollama(text):
     """
-    Pass the text to Ollama running locally with the qwen3.5:9b model.
+    Extract job details using ADK with Ollama model.
     """
+    instruction = "You are a helpful assistant. Provide the output strictly in valid JSON format."
     prompt = f"""
     Extract the job details from the following search result snippet.
     Provide the output strictly in JSON format with the following keys:
@@ -23,46 +59,28 @@ def extract_job_details_with_ollama(text):
     {text}
     """
 
-    url = "http://localhost:11434/api/generate"
-    payload = {
-        "model": "qwen3.5:9b",
-        "prompt": prompt,
-        "stream": False,
-        "format": "json"
-    }
+    generated_text = _run_adk_agent_sync(prompt, instruction)
+
+    match = re.search(r'\{.*\}', generated_text, re.DOTALL)
+    if match:
+        clean_text = match.group(0)
+    else:
+        clean_text = generated_text
 
     try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        result = response.json()
-
-        # Parse the JSON response from Ollama
-        generated_text = result.get("response", "{}").strip()
-
-        import re
-        match = re.search(r'\{.*\}', generated_text, re.DOTALL)
-        if match:
-            clean_text = match.group(0)
-        else:
-            clean_text = generated_text
-
-        try:
-            return json.loads(clean_text)
-        except json.JSONDecodeError:
-            logger.error(f"Failed to parse JSON from Ollama. Original text: {generated_text}")
-            return None
-
-    except Exception as e:
-        logger.error(f"Error calling Ollama API: {e}")
+        return json.loads(clean_text)
+    except json.JSONDecodeError:
+        logger.error(f"Failed to parse JSON from ADK. Original text: {generated_text}")
         return None
+
 
 def generate_resume_latex(jd_text: str, about_me_text: str) -> str:
     """
-    Generate a tailored LaTeX resume using Ollama.
+    Generate a tailored LaTeX resume using ADK with Ollama model.
     """
-    prompt = f"""Act as an expert technical recruiter and professional resume writer specializing in the software engineering industry. You write highly optimized, tailored, ATS-friendly resumes in LaTeX format. You must NEVER invent or hallucinate responsibilities, skills, or outcomes that are not explicitly stated in the input profile text. You should only rephrase, enhance, and structure what is actually provided, making it sound impactful while strictly avoiding fabrication. If information is missing, you should leave a placeholder like [X%] or [to be specified].
+    instruction = "Act as an expert technical recruiter and professional resume writer specializing in the software engineering industry. You write highly optimized, tailored, ATS-friendly resumes in LaTeX format."
 
-I will provide you with a Job Description (JD) and my complete candidate profile details. The provided details represent EVERYTHING about my background and experience. Your goal is to rewrite and format my resume based on this information so it is highly optimized for Applicant Tracking Systems (ATS). You must build a highly relevant, strong, ATS-friendly tailored resume that is designed to pass with an ATS match score of at least 85%, and instantly demonstrates high technical impact to human hiring managers.
+    prompt = f"""I will provide you with a Job Description (JD) and my complete candidate profile details. The provided details represent EVERYTHING about my background and experience. Your goal is to rewrite and format my resume based on this information so it is highly optimized for Applicant Tracking Systems (ATS). You must build a highly relevant, strong, ATS-friendly tailored resume that is designed to pass with an ATS match score of at least 85%, and instantly demonstrates high technical impact to human hiring managers.
 
 Please follow these strict formatting and content rules:
 
@@ -240,87 +258,52 @@ Use exactly the following preamble and document structure template for the LaTeX
 
 [MY CURRENT RESUME / EXPERIENCE DETAILS]
 {about_me_text}
-    """
-
-    url = "http://localhost:11434/api/generate"
-    payload = {
-        "model": "qwen3.5:9b",
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "num_predict": 4096,
-            "num_ctx": 32768
-        }
-    }
+"""
 
     max_attempts = 3
     for attempt in range(max_attempts):
-        try:
-            logger.info(f"Starting LaTeX generation with Ollama (Attempt {attempt + 1}/{max_attempts})...")
-            response = requests.post(url, json=payload)
-            response.raise_for_status()
-            result = response.json()
+        logger.info(f"Starting LaTeX generation with ADK Agent (Attempt {attempt + 1}/{max_attempts})...")
+        generated_text = _run_adk_agent_sync(prompt, instruction)
 
-            generated_text = result.get("response", "").strip()
-            
-            # Continuation loop if \end{document} is missing
-            max_continuations = 5
-            continuations = 0
-            while "\\end{document}" not in generated_text and continuations < max_continuations:
-                logger.info(f"Generated text is incomplete. Requesting continuation {continuations + 1}/{max_continuations}...")
-                continuation_prompt = f"The previous response was truncated. Continue generating the exact LaTeX code from exactly where you left off. Do not include introductory text, just the raw LaTeX code continuing from: {generated_text[-200:]}"
-                
-                continuation_payload = {
-                    "model": "qwen3.5:9b",
-                    "prompt": continuation_prompt,
-                    "stream": False,
-                    "options": {
-                        "num_predict": 4096,
-                        "num_ctx": 32768
-                    }
-                }
-                
-                cont_response = requests.post(url, json=continuation_payload)
-                cont_response.raise_for_status()
-                cont_result = cont_response.json()
-                cont_text = cont_result.get("response", "")
-                
-                # Remove any markdown code block artifacts from continuation
-                import re
-                cont_text = re.sub(r'^```(?:latex)?\s*', '', cont_text.strip(), flags=re.IGNORECASE)
-                generated_text += " " + cont_text
-                continuations += 1
+        # Continuation loop if \end{document} is missing
+        max_continuations = 5
+        continuations = 0
+        while "\\end{document}" not in generated_text and continuations < max_continuations:
+            logger.info(f"Generated text is incomplete. Requesting continuation {continuations + 1}/{max_continuations}...")
+            continuation_prompt = f"The previous response was truncated. Continue generating the exact LaTeX code from exactly where you left off. Do not include introductory text, just the raw LaTeX code continuing from: {generated_text[-200:]}"
 
-            # Clean up if the model wrapped it in markdown
-            import re
-            generated_text = re.sub(r'^```(?:latex)?\s*', '', generated_text, flags=re.IGNORECASE)
-            generated_text = re.sub(r'\s*```$', '', generated_text)
+            cont_text = _run_adk_agent_sync(continuation_prompt, instruction)
 
-            # Check if it was successfully completed
-            if "\\end{document}" in generated_text:
-                logger.info("LaTeX generation completed successfully.")
-                return generated_text.strip()
-            else:
-                logger.warning(f"Attempt {attempt + 1} failed to generate a complete document even with continuations.")
-                if attempt == max_attempts - 1:
-                    logger.warning("Max attempts reached. Forcing close tags.")
-                    if "\\begin{itemize}" in generated_text and "\\end{itemize}" not in generated_text.split("\\begin{itemize}")[-1]:
-                        generated_text += "\n\\end{itemize}"
-                    generated_text += "\n\\end{document}"
-                    return generated_text.strip()
+            # Remove any markdown code block artifacts from continuation
+            cont_text = re.sub(r'^```(?:latex)?\s*', '', cont_text.strip(), flags=re.IGNORECASE)
+            generated_text += " " + cont_text
+            continuations += 1
 
-        except Exception as e:
-            logger.error(f"Error calling Ollama API for resume generation on attempt {attempt + 1}: {e}")
+        # Clean up if the model wrapped it in markdown
+        generated_text = re.sub(r'^```(?:latex)?\s*', '', generated_text, flags=re.IGNORECASE)
+        generated_text = re.sub(r'\s*```$', '', generated_text)
+
+        # Check if it was successfully completed
+        if "\\end{document}" in generated_text:
+            logger.info("LaTeX generation completed successfully.")
+            return generated_text.strip()
+        else:
+            logger.warning(f"Attempt {attempt + 1} failed to generate a complete document even with continuations.")
             if attempt == max_attempts - 1:
-                return ""
+                logger.warning("Max attempts reached. Forcing close tags.")
+                if "\\begin{itemize}" in generated_text and "\\end{itemize}" not in generated_text.split("\\begin{itemize}")[-1]:
+                    generated_text += "\n\\end{itemize}"
+                generated_text += "\n\\end{document}"
+                return generated_text.strip()
+
+    return ""
 
 def generate_resume_docx_content(jd_text: str, about_me_text: str) -> str:
     """
-    Generate a tailored HTML resume using Ollama, which will be converted to DOCX.
+    Generate a tailored HTML resume using ADK with Ollama model, which will be converted to DOCX.
     """
-    prompt = f"""Act as an expert technical recruiter and professional resume writer specializing in the software engineering industry. You write highly optimized, tailored, ATS-friendly resumes in HTML format. You must NEVER invent or hallucinate responsibilities, skills, or outcomes that are not explicitly stated in the input profile text. You should only rephrase, enhance, and structure what is actually provided, making it sound impactful while strictly avoiding fabrication. If information is missing, you should leave a placeholder like [X%] or [to be specified].
-
-I will provide you with a Job Description (JD) and my complete candidate profile details. The provided details represent EVERYTHING about my background and experience. Your goal is to rewrite and format my resume based on this information so it is highly optimized for Applicant Tracking Systems (ATS). You must build a highly relevant, strong, ATS-friendly tailored resume that is designed to pass with an ATS match score of at least 85%, and instantly demonstrates high technical impact to human hiring managers.
+    instruction = "Act as an expert technical recruiter and professional resume writer specializing in the software engineering industry. You write highly optimized, tailored, ATS-friendly resumes in HTML format."
+    prompt = f"""I will provide you with a Job Description (JD) and my complete candidate profile details. The provided details represent EVERYTHING about my background and experience. Your goal is to rewrite and format my resume based on this information so it is highly optimized for Applicant Tracking Systems (ATS). You must build a highly relevant, strong, ATS-friendly tailored resume that is designed to pass with an ATS match score of at least 85%, and instantly demonstrates high technical impact to human hiring managers.
 
 Please follow these strict formatting and content rules:
 
@@ -342,33 +325,12 @@ Please follow these strict formatting and content rules:
 
 [MY CURRENT RESUME / EXPERIENCE DETAILS]
 {about_me_text}
-    """
-    
-    url = "http://localhost:11434/api/generate"
-    payload = {
-        "model": "qwen3.5:9b",
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "num_predict": 4096,
-            "num_ctx": 32768
-        }
-    }
-    
-    try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        result = response.json()
-        
-        generated_text = result.get("response", "").strip()
-        
-        # Clean up if the model wrapped it in markdown
-        import re
-        generated_text = re.sub(r'^```(?:html)?\s*', '', generated_text, flags=re.IGNORECASE)
-        generated_text = re.sub(r'\s*```$', '', generated_text)
-        
-        return generated_text.strip()
-        
-    except Exception as e:
-        logger.error(f"Error calling Ollama API for DOCX HTML generation: {e}")
-        return ""
+"""
+
+    generated_text = _run_adk_agent_sync(prompt, instruction)
+
+    # Clean up if the model wrapped it in markdown
+    generated_text = re.sub(r'^```(?:html)?\s*', '', generated_text, flags=re.IGNORECASE)
+    generated_text = re.sub(r'\s*```$', '', generated_text)
+
+    return generated_text.strip()
