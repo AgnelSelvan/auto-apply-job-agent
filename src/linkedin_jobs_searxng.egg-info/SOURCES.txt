@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+src/linkedin_jobs_searxng/__init__.py
+src/linkedin_jobs_searxng/cli.py
+src/linkedin_jobs_searxng/scraper.py
+src/linkedin_jobs_searxng/search.py
+src/linkedin_jobs_searxng.egg-info/PKG-INFO
+src/linkedin_jobs_searxng.egg-info/SOURCES.txt
+src/linkedin_jobs_searxng.egg-info/dependency_links.txt
+src/linkedin_jobs_searxng.egg-info/entry_points.txt
+src/linkedin_jobs_searxng.egg-info/requires.txt
+src/linkedin_jobs_searxng.egg-info/top_level.txt
+tests/test_scraper.py

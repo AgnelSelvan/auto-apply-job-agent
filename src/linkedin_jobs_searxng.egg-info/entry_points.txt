@@ -1,0 +1,2 @@
+[console_scripts]
+linkedin-jobs = linkedin_jobs_searxng.cli:main

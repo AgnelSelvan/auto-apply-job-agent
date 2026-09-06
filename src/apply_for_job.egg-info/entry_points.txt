@@ -1,0 +1,2 @@
+[console_scripts]
+apply-for-job = apply_for_job.cli:main
