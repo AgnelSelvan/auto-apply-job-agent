@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "apply-for-job"
+name = "auto-apply-job-agent"
 version = "0.1.0"
 description = "Search LinkedIn jobs via SearXNG and scrape details"
 authors = [{name = "Developer"}]
@@ -25,7 +25,7 @@ dev = [
 ]
 
 [project.scripts]
-apply-for-job = "apply_for_job.cli:main"
+auto-apply-job-agent = "apply_for_job.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
