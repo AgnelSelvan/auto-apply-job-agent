@@ -5,3 +5,4 @@ about_me.md
 *.db
 *.pyc
 __pycache__/*
+src/*.egg-info/

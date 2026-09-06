@@ -14,29 +14,38 @@ from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
 from .subagent_job_search import run_job_search_agent
+from .subagent_greeting import run_greeting_agent
 
 async def run_chat():
     load_dotenv()
 
-    chatbot = Agent(
-        name="job_search_chatbot",
+    coordinator_agent = Agent(
+        name="coordinator_agent",
         model="ollama/qwen2.5:7b",
-        instruction="""You are a helpful and polite job searching assistant.
-        When the user sends a message, determine if it is related to job searching (e.g., they provide a role and location).
-        - If it IS related to job searching, you must call the `run_job_search_agent` tool with the user's query to trigger the subagent.
-        - If the chat is NOT related to job searching or applying for jobs, politely tell the user that you are only able to assist with job searches and applications. DO NOT call any tools.
+        instruction="""You are a strict routing assistant. You MUST use the tools provided to answer the user.
+
+        RULES FOR TOOL SELECTION:
+        1. If the user says "hi", "hello", "hey", or asks "what can you do?", you MUST call the `run_greeting_agent` tool. DO NOT call `run_job_search_agent`.
+        2. If the user asks to search for jobs, find jobs, or apply for jobs (e.g., "find me software engineer jobs in New York"), you MUST call the `run_job_search_agent` tool.
+        3. Only use ONE tool per user message.
+        4. If the message is a greeting, do NOT assume it's a job search.
+        5. CRITICAL: Once you receive the output from the tool you called, output that exact text to the user and STOP immediately. DO NOT call any other tools. DO NOT try to answer further.
+
+        Pass the exact user message as the query argument to whichever tool you choose.
         """,
-        tools=[run_job_search_agent]
+        tools=[run_greeting_agent, run_job_search_agent]
     )
 
     session_service = InMemorySessionService()
     session_id = "chat_session"
     await session_service.create_session(app_name="job_app", user_id="user", session_id=session_id)
-    runner = Runner(agent=chatbot, app_name="job_app", session_service=session_service)
+    runner = Runner(agent=coordinator_agent, app_name="job_app", session_service=session_service)
 
     print("======================================================")
-    print(" Job Search Chatbot initialized. Type 'exit' to quit. ")
+    print(" Job Search Coordinator initialized. Type 'exit' to quit. ")
     print("======================================================")
+
+    import uuid
 
     while True:
         try:
@@ -51,10 +60,20 @@ async def run_chat():
         if not user_input.strip():
             continue
 
+        # Generate a fresh session ID for each turn so the coordinator doesn't get confused by history
+        current_session_id = f"chat_session_{uuid.uuid4()}"
+        await session_service.create_session(app_name="job_app", user_id="user", session_id=current_session_id)
+
+        # Reset tool execution flags for the new turn
+        from .subagent_greeting import reset_greeting_flag
+        from .subagent_job_search import reset_job_search_flag
+        reset_greeting_flag()
+        reset_job_search_flag()
+
         print("Assistant: ", end="", flush=True)
         try:
             async for event in runner.run_async(
-                user_id="user", session_id=session_id,
+                user_id="user", session_id=current_session_id,
                 new_message=types.Content(role="user", parts=[types.Part.from_text(text=user_input)])
             ):
                 # Extract text from all events as they stream in

@@ -29,11 +29,24 @@ def init_db(db_name="jobs.db"):
     conn.commit()
     conn.close()
 
+_search_called = False
+_store_called = False
+
+def reset_inner_tools():
+    global _search_called, _store_called
+    _search_called = False
+    _store_called = False
+
 async def search_jobs_on_linkedin(role: str, location: str) -> str:
     """
     Search LinkedIn for jobs based on role and location using Playwright.
     Returns a JSON string of up to 5 job applications.
     """
+    global _search_called
+    if _search_called:
+        return "ERROR: You already searched for jobs. DO NOT call this tool again. Proceed to store them."
+    _search_called = True
+
     print(f"\n[SubAgent] Searching LinkedIn for '{role}' in '{location}'...")
     jobs = []
     try:
@@ -90,6 +103,11 @@ def store_jobs_in_db(jobs_json: str) -> str:
     """
     Store jobs JSON string into the SQLite database 'jobs.db'.
     """
+    global _store_called
+    if _store_called:
+        return "ERROR: You already stored jobs. DO NOT call this tool again. Reply directly to the user."
+    _store_called = True
+
     print(f"\n[SubAgent] Storing jobs into SQLite database...")
     try:
         jobs = json.loads(jobs_json)
@@ -112,36 +130,54 @@ def store_jobs_in_db(jobs_json: str) -> str:
             ))
         conn.commit()
         conn.close()
+
+        stored_jobs_summary = "\n".join([f"- {j.get('job_title', 'Unknown')} at {j.get('job_poster', 'Unknown')}" for j in jobs])
         print(f"\n[SubAgent] Successfully stored {len(jobs)} jobs in jobs.db.")
-        return f"Successfully stored {len(jobs)} jobs in jobs.db."
+        return f"Successfully stored {len(jobs)} jobs in jobs.db. Here are the jobs you should list to the user:\n{stored_jobs_summary}"
     except Exception as e:
         print(f"\n[SubAgent] Error storing jobs: {e}")
         return f"Failed to store jobs: {e}"
 
+# Global flag to prevent loop
+_job_search_called_this_turn = False
+
+def reset_job_search_flag():
+    global _job_search_called_this_turn
+    _job_search_called_this_turn = False
+    reset_inner_tools()
+
 async def run_job_search_agent(query: str) -> str:
     """
-    This function acts as a tool to trigger the subagent for job searches.
+    Call this tool ONLY when the user explicitly asks to search for jobs, find jobs, or apply to jobs.
+    Do NOT call this tool if the user is just saying hello or asking what you can do.
     """
+    global _job_search_called_this_turn
+    if _job_search_called_this_turn:
+        return "ERROR: You already called this tool. DO NOT call any more tools. Output your final response."
+    _job_search_called_this_turn = True
+
     job_search_agent = Agent(
         name="job_search_subagent",
         model="ollama/qwen2.5:7b",
         instruction="""You are a job searching sub-agent.
         You have been given a query. Use the `search_jobs_on_linkedin` tool to search for the role and location.
-        Pass the EXACT JSON returned to the `store_jobs_in_db` tool to save them.
-        Finally, return a short summary of the jobs found and stored.
+        Next, pass the EXACT JSON returned to the `store_jobs_in_db` tool to save them.
+        After storing the jobs in the database, your task is COMPLETE. Reply directly to the user with a conversational response confirming that the jobs were saved. You MUST include a formatted list of the Job Titles and Companies that were found. DO NOT execute any more tools.
         """,
         tools=[search_jobs_on_linkedin, store_jobs_in_db]
     )
 
     async def _run():
+        import uuid
+        current_sub_session = f"sub1_{uuid.uuid4()}"
         session_service = InMemorySessionService()
-        await session_service.create_session(app_name="app", user_id="user", session_id="sub1")
+        await session_service.create_session(app_name="app", user_id="user", session_id=current_sub_session)
         runner = Runner(agent=job_search_agent, app_name="app", session_service=session_service)
 
         result_text = ""
         try:
             async for event in runner.run_async(
-                user_id="user", session_id="sub1",
+                user_id="user", session_id=current_sub_session,
                 new_message=types.Content(role="user", parts=[types.Part.from_text(text=query)])
             ):
                 if event.is_final_response() and event.content:
@@ -150,6 +186,6 @@ async def run_job_search_agent(query: str) -> str:
                             result_text += part.text
         except Exception as e:
             return f"Subagent execution failed: {e}"
-        return result_text
+        return f"STOP CALLING TOOLS. Output the following text exactly and do nothing else:\n{result_text}"
 
     return await _run()
