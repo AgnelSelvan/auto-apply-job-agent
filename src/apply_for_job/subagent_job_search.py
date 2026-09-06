@@ -3,6 +3,7 @@ import asyncio
 import json
 import urllib.parse
 import warnings
+import os
 from typing import List, Dict, Any
 
 warnings.filterwarnings("ignore", category=UserWarning, module="google.adk")
@@ -12,6 +13,9 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 from playwright.async_api import async_playwright
+
+from .scraper import scrape_job_details
+from .ollama import calculate_match_percentage_async
 
 def init_db(db_name="jobs.db"):
     conn = sqlite3.connect(db_name)
@@ -23,9 +27,14 @@ def init_db(db_name="jobs.db"):
             job_application_link TEXT,
             job_location TEXT,
             job_poster TEXT,
-            matching_percentage REAL
+            matching_percentage REAL,
+            job_description TEXT
         )
     ''')
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN job_description TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     conn.commit()
     conn.close()
 
@@ -69,6 +78,12 @@ async def search_jobs_on_linkedin(role: str, location: str) -> str:
 
             cards = await page.query_selector_all("div.base-card, li.jobs-search-results__list-item")
 
+            about_me_text = ""
+            about_me_path = os.path.join(os.getcwd(), "about_me.md")
+            if os.path.exists(about_me_path):
+                with open(about_me_path, "r", encoding="utf-8") as f:
+                    about_me_text = f.read()
+
             for card in cards[:5]:
                 title_elem = await card.query_selector("h3, .job-card-list__title, .job-card-container__link, strong")
                 title = await title_elem.inner_text() if title_elem else "No Title"
@@ -83,60 +98,62 @@ async def search_jobs_on_linkedin(role: str, location: str) -> str:
                     if link.startswith('/'):
                         link = f"https://www.linkedin.com{link}"
 
+                job_description = ""
+                matching_percentage = 0.0
+
+                if link != "No URL":
+                    try:
+                        print(f"[SubAgent] Scraping details for {title}...")
+                        job_description, _, _ = scrape_job_details(link)
+
+                        if job_description and about_me_text:
+                            print(f"[SubAgent] Calculating match percentage for {title}...")
+                            matching_percentage = await calculate_match_percentage_async(job_description, about_me_text)
+                    except Exception as scrape_e:
+                        print(f"[SubAgent] Failed to scrape or match {link}: {scrape_e}")
+
                 jobs.append({
                     "job_title": title.strip(),
                     "job_poster": company.strip(),
                     "job_application_link": link.strip(),
                     "job_location": location,
-                    "matching_percentage": 0.0
+                    "matching_percentage": matching_percentage,
+                    "job_description": job_description
                 })
 
             await browser.close()
     except Exception as e:
         print(f"\n[SubAgent] Error during Playwright search: {e}")
-        return json.dumps({"error": str(e)})
+        return f"Error: {e}"
 
     print(f"\n[SubAgent] Found {len(jobs)} jobs.")
-    return json.dumps(jobs)
-
-def store_jobs_in_db(jobs_json: str) -> str:
-    """
-    Store jobs JSON string into the SQLite database 'jobs.db'.
-    """
-    global _store_called
-    if _store_called:
-        return "ERROR: You already stored jobs. DO NOT call this tool again. Reply directly to the user."
-    _store_called = True
-
-    print(f"\n[SubAgent] Storing jobs into SQLite database...")
+    
     try:
-        jobs = json.loads(jobs_json)
-        if isinstance(jobs, dict) and "error" in jobs:
-            return f"Cannot store jobs due to previous error: {jobs['error']}"
-
+        print(f"\n[SubAgent] Storing jobs into SQLite database...")
         init_db()
         conn = sqlite3.connect("jobs.db")
         cursor = conn.cursor()
         for job in jobs:
             cursor.execute('''
-                INSERT INTO jobs (job_title, job_application_link, job_location, job_poster, matching_percentage)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO jobs (job_title, job_application_link, job_location, job_poster, matching_percentage, job_description)
+                VALUES (?, ?, ?, ?, ?, ?)
             ''', (
                 job.get("job_title", ""),
                 job.get("job_application_link", ""),
                 job.get("job_location", ""),
                 job.get("job_poster", ""),
-                job.get("matching_percentage", 0.0)
+                job.get("matching_percentage", 0.0),
+                job.get("job_description", "")
             ))
         conn.commit()
         conn.close()
-
-        stored_jobs_summary = "\n".join([f"- {j.get('job_title', 'Unknown')} at {j.get('job_poster', 'Unknown')}" for j in jobs])
         print(f"\n[SubAgent] Successfully stored {len(jobs)} jobs in jobs.db.")
-        return f"Successfully stored {len(jobs)} jobs in jobs.db. Here are the jobs you should list to the user:\n{stored_jobs_summary}"
     except Exception as e:
         print(f"\n[SubAgent] Error storing jobs: {e}")
         return f"Failed to store jobs: {e}"
+
+    stored_jobs_summary = "\n".join([f"- {j.get('job_title', 'Unknown')} at {j.get('job_poster', 'Unknown')} (Match: {j.get('matching_percentage', 0):.1f}%)" for j in jobs])
+    return f"Successfully searched and stored {len(jobs)} jobs in jobs.db. Here are the jobs and their match percentages you should list to the user:\n{stored_jobs_summary}"
 
 # Global flag to prevent loop
 _job_search_called_this_turn = False
@@ -144,7 +161,8 @@ _job_search_called_this_turn = False
 def reset_job_search_flag():
     global _job_search_called_this_turn
     _job_search_called_this_turn = False
-    reset_inner_tools()
+    global _search_called
+    _search_called = False
 
 async def run_job_search_agent(query: str) -> str:
     """
@@ -161,10 +179,10 @@ async def run_job_search_agent(query: str) -> str:
         model="ollama/qwen2.5:7b",
         instruction="""You are a job searching sub-agent.
         You have been given a query. Use the `search_jobs_on_linkedin` tool to search for the role and location.
-        Next, pass the EXACT JSON returned to the `store_jobs_in_db` tool to save them.
-        After storing the jobs in the database, your task is COMPLETE. Reply directly to the user with a conversational response confirming that the jobs were saved. You MUST include a formatted list of the Job Titles and Companies that were found. DO NOT execute any more tools.
+        This tool will automatically search LinkedIn, scrape the descriptions, compute match percentages, and save the jobs to the database.
+        After running the tool, your task is COMPLETE. Reply directly to the user with a conversational response confirming that the jobs were saved. You MUST include a formatted list of the Job Titles, Companies, and their Match Percentages that were found. DO NOT execute any more tools.
         """,
-        tools=[search_jobs_on_linkedin, store_jobs_in_db]
+        tools=[search_jobs_on_linkedin]
     )
 
     async def _run():

@@ -74,6 +74,67 @@ def extract_job_details_with_ollama(text):
         return None
 
 
+async def _run_adk_agent_async(prompt: str, instruction: str) -> str:
+    """Helper to run the ADK Agent asynchronously."""
+    agent = Agent(
+        name="resume_agent",
+        model="ollama/qwen2.5:7b",
+        instruction=instruction,
+    )
+    import uuid
+    current_session = f"match_session_{uuid.uuid4()}"
+    session_service = InMemorySessionService()
+    await session_service.create_session(app_name="app", user_id="user", session_id=current_session)
+    runner = Runner(agent=agent, app_name="app", session_service=session_service)
+
+    result_text = ""
+    try:
+        async for event in runner.run_async(
+            user_id="user", session_id=current_session,
+            new_message=types.Content(role="user", parts=[types.Part.from_text(text=prompt)])
+        ):
+            if event.is_final_response() and event.content:
+                for part in event.content.parts:
+                    if hasattr(part, 'text') and part.text:
+                        result_text += part.text
+    except Exception as e:
+        logger.error(f"Error running ADK Agent async: {e}")
+
+    return result_text.strip()
+
+def calculate_match_percentage(job_description: str, about_me: str) -> float:
+    """Synchronous match calculator (legacy)."""
+    return asyncio.run(calculate_match_percentage_async(job_description, about_me))
+
+async def calculate_match_percentage_async(job_description: str, about_me: str) -> float:
+    """
+    Evaluates the job description against the candidate's profile to calculate a match percentage asynchronously.
+    """
+    instruction = "You are an expert technical recruiter and ATS system. Output ONLY a raw number between 0 and 100 representing the match percentage. Do not include any other text, symbols, or explanations."
+    prompt = f"""
+    Evaluate how well the candidate's profile matches the job description.
+    Analyze the skills, experience, and requirements.
+    Output ONLY a single integer from 0 to 100.
+
+    [JOB DESCRIPTION]
+    {job_description[:2000]}  # Truncate to avoid context window issues
+
+    [CANDIDATE PROFILE]
+    {about_me[:3000]}
+    """
+
+    generated_text = await _run_adk_agent_async(prompt, instruction)
+    
+    match = re.search(r'\d+', generated_text)
+    if match:
+        try:
+            score = float(match.group(0))
+            return min(100.0, max(0.0, score))
+        except ValueError:
+            pass
+    return 0.0
+
+
 def generate_resume_latex(jd_text: str, about_me_text: str) -> str:
     """
     Generate a tailored LaTeX resume using ADK with Ollama model.
