@@ -16,6 +16,7 @@ from playwright.async_api import async_playwright
 
 from .scraper import scrape_job_details
 from .ollama import calculate_match_percentage_async
+from .subagent_apply_job import run_apply_for_job_agent
 
 def init_db(db_name="jobs.db"):
     conn = sqlite3.connect(db_name)
@@ -34,7 +35,11 @@ def init_db(db_name="jobs.db"):
     try:
         cursor.execute("ALTER TABLE jobs ADD COLUMN job_description TEXT")
     except sqlite3.OperationalError:
-        pass  # Column already exists
+        pass
+    try:
+        cursor.execute("ALTER TABLE jobs ADD COLUMN status TEXT DEFAULT 'PENDING'")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -127,27 +132,65 @@ async def search_jobs_on_linkedin(role: str, location: str) -> str:
         return f"Error: {e}"
 
     print(f"\n[SubAgent] Found {len(jobs)} jobs.")
-    
+
     try:
         print(f"\n[SubAgent] Storing jobs into SQLite database...")
         init_db()
         conn = sqlite3.connect("jobs.db")
         cursor = conn.cursor()
+        
+        jobs_to_apply = []
+        newly_added_count = 0
+        
         for job in jobs:
-            cursor.execute('''
-                INSERT INTO jobs (job_title, job_application_link, job_location, job_poster, matching_percentage, job_description)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                job.get("job_title", ""),
-                job.get("job_application_link", ""),
-                job.get("job_location", ""),
-                job.get("job_poster", ""),
-                job.get("matching_percentage", 0.0),
-                job.get("job_description", "")
-            ))
+            link = job.get("job_application_link", "")
+            
+            if link and link != "No URL":
+                # Check if job already exists
+                cursor.execute("SELECT job_id, status FROM jobs WHERE job_application_link = ?", (link,))
+                existing_job = cursor.fetchone()
+                
+                if existing_job:
+                    job["job_id"] = existing_job[0]
+                    status = existing_job[1]
+                    print(f"[SubAgent] Job already in DB (Status: {status}), skipping insert: {job.get('job_title')}")
+                    if status != 'JOB_APPLIED':
+                        jobs_to_apply.append(job)
+                else:
+                    cursor.execute('''
+                        INSERT INTO jobs (job_title, job_application_link, job_location, job_poster, matching_percentage, job_description)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    ''', (
+                        job.get("job_title", ""),
+                        link,
+                        job.get("job_location", ""),
+                        job.get("job_poster", ""),
+                        job.get("matching_percentage", 0.0),
+                        job.get("job_description", "")
+                    ))
+                    job["job_id"] = cursor.lastrowid
+                    jobs_to_apply.append(job)
+                    newly_added_count += 1
+            else:
+                print(f"[SubAgent] Skipping job with no URL: {job.get('job_title')}")
+
         conn.commit()
         conn.close()
-        print(f"\n[SubAgent] Successfully stored {len(jobs)} jobs in jobs.db.")
+        print(f"\n[SubAgent] Successfully added {newly_added_count} new jobs to jobs.db.")
+
+        # Trigger the apply_for_job_agent for each job that needs applying
+        for job in jobs_to_apply:
+            link = job.get("job_application_link", "")
+            job_id = job.get("job_id")
+            if link and link != "No URL":
+                success = await run_apply_for_job_agent(link)
+                if success:
+                    update_conn = sqlite3.connect("jobs.db")
+                    update_conn.execute("UPDATE jobs SET status = 'JOB_APPLIED' WHERE job_id = ?", (job_id,))
+                    update_conn.commit()
+                    update_conn.close()
+                    print(f"\n[SubAgent] Job {job_id} marked as JOB_APPLIED in database.")
+
     except Exception as e:
         print(f"\n[SubAgent] Error storing jobs: {e}")
         return f"Failed to store jobs: {e}"

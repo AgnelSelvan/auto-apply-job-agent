@@ -6,3 +6,4 @@ about_me.md
 *.pyc
 __pycache__/*
 src/*.egg-info/
+playwright_profile/
